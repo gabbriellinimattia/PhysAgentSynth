@@ -4,18 +4,27 @@ del risultato di ogni modifica.
 
 Prerequisiti:
   - resonator_predictor_<tipo>.pt allenati (train_all_predictors.py) per
-    strike/pluck/shaker/noise. Senza, i parametri dell'exciter restano ai
-    default fissi e solo Q/rolloff del banco modale rispondono ai
-    descrittori (harmonicity/rolloff/e_low/e_mid/e_high/flux/t_centroid
+    strike/pluck/shaker/noise/chaotic. Senza, i parametri dell'exciter
+    restano ai default fissi e solo Q/rolloff del banco modale rispondono
+    ai descrittori (harmonicity/rolloff/e_low/e_mid/e_high/flux/t_centroid
     non hanno effetto - vedi nota in ModalBank.warm_start: l'unico posto
-    che li applica davvero e' il delta del predittore).
+    che li applica davvero e' il delta del predittore). bow/blow non hanno
+    predittore per costruzione (vedi SUPPORTED_TYPES in
+    resonator_predictor.py): solo warm start analitico, sempre.
   - pip install sounddevice   (bindings PortAudio per l'audio in uscita)
 
-"noise" e' continuo (sliders cambiano il timbro mentre suona); strike/
-pluck/shaker sono a impulso: premi Trigger (o barra spazio) per un colpo,
-il decadimento che senti dopo e' il RING naturale del banco modale
-(memoria del filtro, non un inviluppo aggiunto) - puoi anche muovere gli
-slider mentre sta ancora suonando e sentirne l'effetto sul ring in corso.
+"noise"/bow/blow sono continui (sliders cambiano il timbro mentre
+suonano); strike/pluck/shaker/chaotic sono a impulso: premi Trigger (o
+barra spazio) per un colpo, il decadimento che senti dopo e' il RING
+naturale del banco modale (memoria del filtro, non un inviluppo aggiunto)
+- puoi anche muovere gli slider mentre sta ancora suonando e sentirne
+l'effetto sul ring in corso. chaotic: la non-linearita' di coupling tra
+modi non e' implementata nel motore realtime (solo nel fit offline via
+FFT) - suona col preset freq/gain/Q imparato dal predittore, non col
+comportamento dinamico caotico vero. bow/blow: preview semplificato,
+armoniche oltre la 12a perse (vedi _rebuild_feedback) e senza tremolo/
+rumore ad alta frequenza separato (mod_rate/mod_depth/hf_roughness,
+solo bow) ne' rampa d'attacco (solo blow) - solo tono+rumore base.
 
 Uso: python3 synth_gui_rt.py
 """
@@ -42,7 +51,8 @@ BLOCK = 256
 N_MODES = 12
 GLIDE_MS = 60          # finestra di interpolazione ad ogni cambio slider (control-rate GUI, non l'X-time di un agente esterno)
 BURST_SECONDS = 1.0    # durata del render dell'exciter ad un Trigger (stessa convenzione del training)
-TYPES = ["strike", "pluck", "shaker", "noise"]
+TYPES = ["strike", "pluck", "shaker", "noise", "chaotic", "bow", "blow"]
+FEEDBACK_TYPES = ("bow", "blow")   # tono armonico continuo + rumore che bypassa il banco (vedi _rebuild_feedback/audio_callback)
 
 lock = threading.Lock()
 state = {
@@ -53,8 +63,60 @@ state = {
                "flux": 0.15, "spread": 800.0, "t_centroid": 0.05},
 }
 bank = ModalBankRT(SR, n_modes=N_MODES)
+_limiter_env = 1e-6   # stato del limiter RT, vedi audio_callback
+_tone_phase = 0.0     # fase persistente del fondamentale bow/blow tra blocchi, vedi audio_callback
 burst_queue = queue.Queue()
-current_exciter = {"obj": None, "type": None}
+current_exciter = {"obj": None, "type": None, "feedback": None}
+
+
+def _rebuild_feedback(target, f0, exciter_type):
+    """bow/blow: architettura diversa dagli altri exciter (vedi
+    _feedback_synthesize in physical_agents_train.py) - tono armonico a
+    n_harm righe esatte (6-24, scala con f0/target, vedi _n_harm_feedback)
+    che il banco modale shape-a via warm_start(is_feedback=True), PIU'
+    rumore colorato concentrato attorno a f0 che bypassa il banco e si
+    somma dopo (altrimenti il filtro ad alto Q lo "ripulisce" in energia
+    tonale, vedi nota in BowExciter). Nessun predittore esiste per questi
+    due tipi (SUPPORTED_TYPES in resonator_predictor.py li esclude
+    esplicitamente), quindi qui non c'e' correzione di delta, solo warm
+    start analitico - stesso limite del training offline.
+
+    Cap n_harm a N_MODES: ModalBankRT alloca stato di dimensione fissa
+    all'avvio (non ridimensionabile a runtime); offline si arriva fino a
+    24 per note gravi con target e_high alto, qui il preview realtime
+    perde le armoniche oltre la 12a - semplificazione accettata."""
+    exciter = P.EXCITERS[exciter_type](SR)
+    n_harm = min(P._n_harm_feedback(f0, target), N_MODES)
+    modal = P.ModalBank(SR, n_modes=n_harm, f0_init=f0, use_decay_envelope=False,
+                        use_coupling=False, use_legacy_filter=False)
+    modal.warm_start(target, f0=f0, is_feedback=True, exciter_type=exciter_type)
+    with torch.no_grad():
+        freq = torch.exp(modal.freq_raw).numpy()
+        gain = F.softplus(modal.gain_raw).numpy()
+        q = torch.clamp(F.softplus(modal.q_raw) + 0.4, max=P.Q_MAX).numpy()
+    pad = N_MODES - n_harm
+    if pad > 0:   # modi oltre n_harm: gain 0 (silenti), freq/q un valore qualunque innocuo
+        freq = np.concatenate([freq, np.full(pad, freq[-1])])
+        gain = np.concatenate([gain, np.zeros(pad)])
+        q = np.concatenate([q, np.full(pad, 1.0)])
+    params = exciter.params()
+    k = np.arange(1, n_harm + 1)
+    if exciter_type == "blow":
+        amp = P._tone_amp_profile(f0, n_harm, target).numpy()
+    else:
+        amp = 1.0 / (k ** float(params["p"]))
+        amp = amp / amp.sum()
+    feedback_state = {
+        "f0": float(f0), "n_harm": n_harm, "amp": amp,
+        "pressure": float(params["pressure"]), "roughness": float(params["roughness"]),
+        "noise_slope_raw": params["noise_slope"], "focus_bw": float(params["focus_bw"]),
+    }
+    glide_samples = int(GLIDE_MS * 1e-3 * SR)
+    with lock:
+        bank.set_target(freq, gain, q, glide_samples)
+        current_exciter["obj"] = exciter
+        current_exciter["type"] = exciter_type
+        current_exciter["feedback"] = feedback_state
 
 
 def rebuild(target, f0, exciter_type):
@@ -62,11 +124,23 @@ def rebuild(target, f0, exciter_type):
     correzione del predittore, se il checkpoint esiste) e li applica al
     motore RT. Chiamato ad ogni cambio slider: e' lavoro a control-rate
     (una piccola MLP + qualche formula), non deve essere lock-free."""
+    if exciter_type in FEEDBACK_TYPES:
+        _rebuild_feedback(target, f0, exciter_type)
+        return
     exciter = P.EXCITERS[exciter_type](SR)
-    # use_legacy_filter allineato a train_agent: solo "noise" (niente chaotic
-    # in questa GUI, vedi TYPES) resta sul vecchio filtro H(0)=1.
-    modal = P.ModalBank(SR, n_modes=N_MODES, f0_init=f0, use_decay_envelope=False, use_coupling=False,
-                        use_legacy_filter=(exciter_type == "noise"))
+    # use_legacy_filter/use_coupling allineati a train_agent (physical_agents_
+    # train.py): chaotic riattivato in questa GUI 2026-09-12, serve
+    # use_coupling=True altrimenti la non-linearita' che lo caratterizza
+    # (_nonlinear_coupling) semplicemente non esiste nel modal creato qui, e
+    # il predittore chaotic (che si aspetta anche coupling_raw/
+    # coupling_threshold_raw nel suo delta, vedi _new_modules in
+    # resonator_predictor.py) applicherebbe un delta piu' corto di quanto il
+    # modal si aspetti in silenzio. use_decay_envelope resta False per
+    # tutti: a runtime il decadimento e' il ring naturale del biquad
+    # (ModalBankRT), non serve l'inviluppo esplicito usato nel fit offline.
+    modal = P.ModalBank(SR, n_modes=N_MODES, f0_init=f0, use_decay_envelope=False,
+                        use_coupling=(exciter_type == "chaotic"),
+                        use_legacy_filter=(exciter_type in ("noise", "chaotic")))
     modal.warm_start(target, f0=f0, is_feedback=False, exciter_type=exciter_type)
     model = load_predictor(exciter_type)
     if model is not None:
@@ -82,6 +156,7 @@ def rebuild(target, f0, exciter_type):
         bank.set_target(freq, gain, q, glide_samples)
         current_exciter["obj"] = exciter
         current_exciter["type"] = exciter_type
+        current_exciter["feedback"] = None
 
 
 def on_change(*_):
@@ -99,7 +174,7 @@ def on_change(*_):
 def trigger():
     with lock:
         etype, exciter = current_exciter["type"], current_exciter["obj"]
-    if exciter is None or etype not in ("strike", "pluck", "shaker"):
+    if exciter is None or etype not in ("strike", "pluck", "shaker", "chaotic"):
         return   # "noise" e' gia' continuo, nessun impulso da accodare
     with torch.no_grad():
         burst = exciter(int(BURST_SECONDS * SR)).numpy().astype(np.float64)
@@ -108,11 +183,32 @@ def trigger():
 
 
 def audio_callback(outdata, frames, time_info, status):
+    global _tone_phase
     with lock:
         etype, exciter = current_exciter["type"], current_exciter["obj"]
-    if etype == "noise" and exciter is not None:
+        fb = current_exciter["feedback"]
+    if etype in FEEDBACK_TYPES and fb is not None:
+        # tono a fase persistente (continuita' tra blocchi: ricalcolarla da
+        # zero ogni blocco produrrebbe un salto di fase, udibile come click,
+        # ad ogni chiamata del callback) passato nel banco per lo shaping
+        # formantico, rumore sommato DOPO bypassando il banco - stessa
+        # architettura additiva di _feedback_synthesize, vedi _rebuild_feedback.
+        t = np.arange(frames)
+        w = 2.0 * np.pi * fb["f0"] / SR
+        phases = _tone_phase + w * t
+        tone = np.zeros(frames)
+        for k_idx in range(1, fb["n_harm"] + 1):
+            tone += fb["amp"][k_idx - 1] * np.sin(k_idx * phases)
+        _tone_phase = float((_tone_phase + w * frames) % (2.0 * np.pi))
+        tone *= fb["pressure"]
+        with torch.no_grad():
+            noise = fb["roughness"] * P._colored_noise(
+                frames, SR, fb["noise_slope_raw"], center_hz=fb["f0"], bw=fb["focus_bw"]).numpy()
+        y = bank.process_block(tone) + fb["pressure"] * noise
+    elif etype == "noise" and exciter is not None:
         with torch.no_grad():
             excitation = exciter(frames).numpy().astype(np.float64)
+        y = bank.process_block(excitation)
     else:
         try:
             excitation = burst_queue.get_nowait()
@@ -124,11 +220,25 @@ def audio_callback(outdata, frames, time_info, status):
             # y[n-2] del biquad) - esattamente il comportamento fisico di
             # un risonatore che si spegne, non un inviluppo simulato.
             excitation = np.zeros(frames)
-    y = bank.process_block(excitation)
-    peak = np.abs(y).max()
-    if peak > 0.95:
-        y = y / peak * 0.95
-    outdata[:, 0] = y.astype(np.float32)
+        y = bank.process_block(excitation)
+    # Limiter con inviluppo persistente (attacco veloce, rilascio lento) al
+    # posto del rescale istantaneo per-blocco: quest'ultimo (peak locale del
+    # SOLO blocco corrente, ~256 campioni=5.8ms a 44.1kHz) cambia guadagno di
+    # continuo blocco per blocco seguendo il ripple naturale di modi
+    # risonanti che battono tra loro - fisiologico anche a Q moderate - e
+    # quel guadagno che salta ogni 5.8ms senza alcuno smoothing e' udibile
+    # come distorsione/pumping continuo su OGNI exciter (segnalato in
+    # sessione), non un vero overs occasionale. Qui l'inviluppo di picco
+    # sale quasi subito su un transiente (attacco ~1 blocco, previene comunque
+    # gli overs) ma scende su ~30 blocchi (~170ms, rilascio lento): il
+    # guadagno resta stabile sul ring naturale di un modo invece di
+    # rincorrerne ogni micro-fluttuazione.
+    global _limiter_env
+    block_peak = float(np.abs(y).max())
+    coef = 0.9 if block_peak > _limiter_env else 0.03
+    _limiter_env += coef * (block_peak - _limiter_env)
+    gain = min(1.0, 0.95 / max(_limiter_env, 1e-6))
+    outdata[:, 0] = (y * gain).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
