@@ -21,10 +21,14 @@ naturale del banco modale (memoria del filtro, non un inviluppo aggiunto)
 l'effetto sul ring in corso. chaotic: la non-linearita' di coupling tra
 modi non e' implementata nel motore realtime (solo nel fit offline via
 FFT) - suona col preset freq/gain/Q imparato dal predittore, non col
-comportamento dinamico caotico vero. bow/blow: preview semplificato,
-armoniche oltre la 12a perse (vedi _rebuild_feedback) e senza tremolo/
-rumore ad alta frequenza separato (mod_rate/mod_depth/hf_roughness,
-solo bow) ne' rampa d'attacco (solo blow) - solo tono+rumore base.
+comportamento dinamico caotico vero. bow/blow: harmonicity/noisiness
+NON hanno effetto per design (Q fissata alta per il tono, non derivata
+dal noisiness target - vedi warm_start); flux/t_centroid neanche, senza
+tremolo (mod_rate/mod_depth, solo bow) ne' rampa d'attacco (solo blow) -
+nessun inviluppo che varia nel tempo in questo preview, solo tono
+continuo+rumore base. centroid/rolloff/spread/e_low/e_mid/e_high invece
+rispondono (bank_feedback dedicato, fino a 24 armoniche - vedi
+_rebuild_feedback).
 
 Uso: python3 synth_gui_rt.py
 """
@@ -63,6 +67,15 @@ state = {
                "flux": 0.15, "spread": 800.0, "t_centroid": 0.05},
 }
 bank = ModalBankRT(SR, n_modes=N_MODES)
+# bank dedicato a bow/blow: fino a P.N_HARM_FEEDBACK_MAX armoniche (24, vedi
+# physical_agents_train.py), non i 12 modi di "bank" - a differenza degli
+# altri exciter (dove il banco sceglie liberamente DOVE mettere i modi,
+# quindi 12 bastano ovunque nello spettro), per bow/blow le frequenze dei
+# modi sono FISSATE alle armoniche esatte di f0: il numero di armoniche
+# determina direttamente quanto in alto puo' arrivare il tono, capare a 12
+# rendeva centroid/rolloff/e_high inefficaci per f0 bassi (non c'era alcuna
+# armonica sopra i 3000Hz da poter enfatizzare).
+bank_feedback = ModalBankRT(SR, n_modes=P.N_HARM_FEEDBACK_MAX)
 _limiter_env = 1e-6   # stato del limiter RT, vedi audio_callback
 _tone_phase = 0.0     # fase persistente del fondamentale bow/blow tra blocchi, vedi audio_callback
 burst_queue = queue.Queue()
@@ -81,25 +94,36 @@ def _rebuild_feedback(target, f0, exciter_type):
     esplicitamente), quindi qui non c'e' correzione di delta, solo warm
     start analitico - stesso limite del training offline.
 
-    Cap n_harm a N_MODES: ModalBankRT alloca stato di dimensione fissa
-    all'avvio (non ridimensionabile a runtime); offline si arriva fino a
-    24 per note gravi con target e_high alto, qui il preview realtime
-    perde le armoniche oltre la 12a - semplificazione accettata."""
+    Usa bank_feedback (fino a 24 modi, non i 12 di "bank"): qui il numero
+    di armoniche determina la frequenza massima raggiungibile dal tono
+    (fisse alle armoniche esatte di f0), a differenza degli altri exciter
+    dove il banco sceglie liberamente dove mettere i modi."""
     exciter = P.EXCITERS[exciter_type](SR)
-    n_harm = min(P._n_harm_feedback(f0, target), N_MODES)
+    n_harm = P._n_harm_feedback(f0, target)
     modal = P.ModalBank(SR, n_modes=n_harm, f0_init=f0, use_decay_envelope=False,
                         use_coupling=False, use_legacy_filter=False)
-    modal.warm_start(target, f0=f0, is_feedback=True, exciter_type=exciter_type)
+    params = exciter.params()
+    # BUG FIX 2026-09-12: mancava, causava "onda triangolare" fissa immune a
+    # centroid/rolloff. Per bow il tono in ingresso ha gia' un'attenuazione
+    # 1/k^p (vedi sotto); senza dirlo a warm_start (tone_amp_exponent), il
+    # gain-fix in _band_gain_profile calcola il profilo di banda come se
+    # l'ingresso fosse piatto - il risultato finito e' dominato dal SOLO
+    # 1/k^p del tono (che non dipende da nessun descrittore) invece che dal
+    # target, mascherando l'effetto di centroid/rolloff/spread. blow resta
+    # None: non usa 1/k^p (vedi _tone_amp_profile sotto), nulla da compensare
+    # - stessa condizione esatta di train_agent (physical_agents_train.py).
+    tone_amp_exponent = float(params["p"]) if exciter_type != "blow" else None
+    modal.warm_start(target, f0=f0, is_feedback=True, exciter_type=exciter_type,
+                      tone_amp_exponent=tone_amp_exponent)
     with torch.no_grad():
         freq = torch.exp(modal.freq_raw).numpy()
         gain = F.softplus(modal.gain_raw).numpy()
         q = torch.clamp(F.softplus(modal.q_raw) + 0.4, max=P.Q_MAX).numpy()
-    pad = N_MODES - n_harm
+    pad = P.N_HARM_FEEDBACK_MAX - n_harm
     if pad > 0:   # modi oltre n_harm: gain 0 (silenti), freq/q un valore qualunque innocuo
         freq = np.concatenate([freq, np.full(pad, freq[-1])])
         gain = np.concatenate([gain, np.zeros(pad)])
         q = np.concatenate([q, np.full(pad, 1.0)])
-    params = exciter.params()
     k = np.arange(1, n_harm + 1)
     if exciter_type == "blow":
         amp = P._tone_amp_profile(f0, n_harm, target).numpy()
@@ -113,7 +137,7 @@ def _rebuild_feedback(target, f0, exciter_type):
     }
     glide_samples = int(GLIDE_MS * 1e-3 * SR)
     with lock:
-        bank.set_target(freq, gain, q, glide_samples)
+        bank_feedback.set_target(freq, gain, q, glide_samples)
         current_exciter["obj"] = exciter
         current_exciter["type"] = exciter_type
         current_exciter["feedback"] = feedback_state
@@ -204,7 +228,7 @@ def audio_callback(outdata, frames, time_info, status):
         with torch.no_grad():
             noise = fb["roughness"] * P._colored_noise(
                 frames, SR, fb["noise_slope_raw"], center_hz=fb["f0"], bw=fb["focus_bw"]).numpy()
-        y = bank.process_block(tone) + fb["pressure"] * noise
+        y = bank_feedback.process_block(tone) + fb["pressure"] * noise
     elif etype == "noise" and exciter is not None:
         with torch.no_grad():
             excitation = exciter(frames).numpy().astype(np.float64)
