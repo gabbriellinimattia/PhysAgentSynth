@@ -62,9 +62,19 @@ python sample_calibration.py                        # calibrazione target su dis
 python synth_gui_rt.py
 ```
 
-Richiede i checkpoint `resonator_predictor_<tipo>.pt` generati da `train_all_predictors.py`.
+Richiede i checkpoint `resonator_predictor_<tipo>.pt` generati da `train_all_predictors.py` — inclusi in questo repo (vedi sotto), gia' pronti all'uso.
+
+## Checkpoint inclusi
+
+`resonator_predictor_{strike,pluck,shaker,noise,chaotic}.pt`, allenati il 12/9 su `predictor_dataset.json` (300 epoch). Qualita' per tipo (loss finale di `physical_agents_train.py` con predittore agganciato, stesso ordine):
+
+- blow 0.27, noise 0.30, bow 0.38, shaker 0.34, strike 0.40 — nella norma
+- **pluck 1.13** — noto mode-collapse (harmonicity target 0.75, ottenuto 0.02): il predittore non risolve ancora il problema, in lavorazione
+- **chaotic 4.91** — instabile, allenato solo per ascolto esplorativo, qualita' non attesa
+
+`bow`/`blow` non hanno un predittore (warm start analitico gia' sufficiente, vedi `resonator_predictor.py`): la loro qualita' viene solo da `physical_agents_train.py`.
 
 ## Note
 
-- Checkpoint `.pt`, log di training e cartella `sample/` non sono versionati: rigenerabili con gli script sopra.
+- Checkpoint `.pt` gia' inclusi; log di training e cartella `sample/` non sono versionati.
 - Vedi `Claude outputs/riassunto_bow_debug.md` per note di debug su un problema noto (exciter bow).

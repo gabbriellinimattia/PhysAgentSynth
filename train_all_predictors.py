@@ -1,6 +1,9 @@
 """train_all_predictors.py - allena resonator_predictor.py per tutti i tipi
-supportati TRANNE "chaotic" (instabile anche dopo le patch tentate in
-sessione a physical_agents_train.py, rimandato - vedi note li').
+supportati in SUPPORTED_TYPES, incluso "chaotic" (riattivato 2026-09-12 su
+richiesta esplicita: era stato rimandato per instabilita' nelle patch
+tentate in sessione a physical_agents_train.py, ma le dimensioni dei
+parametri sono verificate coerenti col dataset - vedi resonator_predictor.py
+_new_modules - quindi si prova comunque, loss finale non garantita buona).
 
 Usa il predictor_dataset.json gia' generato (predictor_dataset_gen.py).
 Un checkpoint per tipo: resonator_predictor_<tipo>.pt (load_predictor in
@@ -12,7 +15,7 @@ import argparse
 
 from resonator_predictor import train_predictor, SUPPORTED_TYPES
 
-SKIP = {"chaotic"}
+SKIP = set()   # chaotic riattivato 2026-09-12, vedi docstring
 
 
 def main(dataset_path="predictor_dataset.json", epochs=300, lr=1e-3, descriptor_weight=0.1):

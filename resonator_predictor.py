@@ -74,7 +74,13 @@ def _new_modules(exciter_type, sr=SR_DEFAULT, n_modes=12):
     # Senza questo allineamento il predittore imparerebbe una mappa
     # target->warm-start calibrata su una fisica diversa da quella usata
     # davvero in training per pluck/strike, invalidando il predittore.
-    modal = ModalBank(sr, n_modes=n_modes, use_decay_envelope=(exciter_type in ("strike", "pluck")),
+    # allineato a use_decay_env in train_agent (physical_agents_train.py):
+    # shaker aggiunto li' (T60 esplicito, l'exciter ha gia' un inviluppo
+    # decadente) ma questa funzione era rimasta ferma alla versione
+    # precedente - mismatch di dimensione (tau_raw, +n_modes) tra il
+    # baseline ricalcolato qui e i "params" salvati nel dataset (generati
+    # via train_agent_best, gia' corretto) - fix 2026-09-12.
+    modal = ModalBank(sr, n_modes=n_modes, use_decay_envelope=(exciter_type in ("strike", "pluck", "shaker")),
                        use_coupling=(exciter_type == "chaotic"),
                        use_legacy_filter=(exciter_type in ("noise", "chaotic")))
     return exciter, modal
